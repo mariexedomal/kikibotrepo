@@ -1,18 +1,22 @@
-# [Project name]
+# Python Discord Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A beginner-friendly Python bot with `/ping` and `/hello` slash commands, using
+the free `discord.py` library.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `uv run discord-bot` — run the Discord bot
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required bot secret: `DISCORD_BOT_TOKEN`
+- `README.md` — Discord application setup and invite instructions
 
 ## Stack
 
+- Python 3.13, `discord.py`, and uv for the Discord bot
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5
 - DB: PostgreSQL + Drizzle ORM
@@ -22,7 +26,10 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `src/discord_bot/bot.py` — Discord client and slash commands
+- `pyproject.toml` / `uv.lock` — Python project metadata and locked dependencies
+- `artifacts/api-server` — shared API service
+- `artifacts/mockup-sandbox` — design canvas preview service
 
 ## Architecture decisions
 
