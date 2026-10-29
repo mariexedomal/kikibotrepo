@@ -5,6 +5,7 @@ description = "A small Python starter for a Discord bot with slash commands."
 requires-python = ">=3.10"
 dependencies = [
     "discord.py>=2.7,<3.0",
+    "google-genai>=2.33.0,<3.0",
 ]
 
 [project.scripts]
