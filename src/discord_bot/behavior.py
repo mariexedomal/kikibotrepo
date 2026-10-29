@@ -3,6 +3,8 @@
 import re
 import unicodedata
 
+from .interests import interest_context_for
+
 
 _KIKI_WORD = re.compile(r"(?<![\w])kiki(?![\w])", re.IGNORECASE)
 _ADDRESS_PREFIX = re.compile(
@@ -60,6 +62,25 @@ _PROTECTED_SPAN = re.compile(
     r"[A-Z][a-z]+(?:[A-Z][A-Za-z0-9]*)+)(?![A-Za-z0-9_])"
 )
 _BOT_MENTION = re.compile(r"<@!?(\d+)>")
+_AI_TERMS = re.compile(
+    r"\b(?:artificial intelligence|intelig[eê]ncia artificial|"
+    r"ia generativa|generative ai|chat\s*gpt|chatgpt|gemini|claude|"
+    r"anthropic|openai|llms?|large language models?|modelos? de linguagem|"
+    r"language models?|machine learning|aprendizado de m[aá]quina|"
+    r"deep learning|redes neurais|neural networks?|ai agents?|"
+    r"agentes? de ia|chatbots? de ia|ai chatbots?)\b",
+    re.IGNORECASE,
+)
+_AI_ABBREVIATION = re.compile(r"(?<!\w)(?:AI|IA)(?!\w)")
+_AI_ABBREVIATION_CONTEXT = re.compile(
+    r"(?<!\w)(?:ai|ia)(?!\w)\s+"
+    r"(?:bot|chatbot|modelo|model|agente|agent|generativa?|generative)\b",
+    re.IGNORECASE,
+)
+_K_LAUGHTER = re.compile(r"(?<!\w)k{3,}(?!\w)", re.IGNORECASE)
+_MACHINE_PHRASE = re.compile(r"\bturn off the machine\b", re.IGNORECASE)
+_ALL_CAPS_WORD = re.compile(r"(?<!\w)[A-ZÀ-Þ][A-ZÀ-Þ0-9_-]{1,}(?!\w)")
+_LATIN_LETTER = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
 
 
 def normalize_text(text: str) -> str:
@@ -114,6 +135,8 @@ def is_relevant_spontaneous_candidate(text: str) -> bool:
     normalized = normalize_text(text)
     if len(normalized) < 10 or normalized.startswith("/"):
         return False
+    if interest_context_for([text]):
+        return True
     if "?" in normalized or "？" in normalized:
         return len(normalized) >= 12
     if _RELEVANT_TERMS.search(normalized):
@@ -130,12 +153,87 @@ def remove_bot_mention(text: str, bot_id: int) -> str:
 
 
 def lowercase_prose(text: str) -> str:
-    """Lowercase prose while preserving code, URLs, Discord tags, and identifiers."""
+    """Lowercase prose while retaining deliberate laughter, emphasis, and glitch text."""
     parts: list[str] = []
     cursor = 0
     for match in _PROTECTED_SPAN.finditer(text):
-        parts.append(text[cursor : match.start()].lower())
+        parts.append(_format_prose(text[cursor : match.start()]))
         parts.append(match.group(0))
         cursor = match.end()
-    parts.append(text[cursor:].lower())
+    parts.append(_format_prose(text[cursor:]))
     return "".join(parts).strip()
+
+
+def _format_prose(text: str) -> str:
+    """Apply Kiki's lower-case style without erasing a few intentional exceptions."""
+    if not text:
+        return text
+
+    preserved: dict[str, str] = {}
+
+    def protect(value: str) -> str:
+        key = f"\u0000{len(preserved)}\u0000"
+        preserved[key] = value
+        return key
+
+    text = _MACHINE_PHRASE.sub(
+        lambda _: protect("TURN OFF THE MACHINE"), text
+    )
+    text = _K_LAUGHTER.sub(lambda match: protect(match.group(0).upper()), text)
+
+    has_letters = bool(_LATIN_LETTER.search(text))
+    all_caps_sentence = has_letters and not re.search(r"[a-zà-öø-ÿ]", text)
+    emphasis_count = 0
+
+    def format_caps(match: re.Match[str]) -> str:
+        nonlocal emphasis_count
+        word = match.group(0)
+        # A fully capitalized sentence is not emphasis. Keep short common acronyms.
+        if all_caps_sentence:
+            if word in {"API", "HTTP", "SQL", "URL", "JSON", "CPU", "GPU", "AI", "IA"}:
+                return word
+            return word.lower()
+        if word in {"API", "HTTP", "SQL", "URL", "JSON", "CPU", "GPU", "AI", "IA"}:
+            return word
+        if not text[: match.start()].strip() or re.search(
+            r"[.!?…]\s*$", text[: match.start()]
+        ):
+            return word.lower()
+        emphasis_count += 1
+        return word if emphasis_count <= 2 else word.lower()
+
+    formatted = _ALL_CAPS_WORD.sub(format_caps, text).lower()
+    for key, value in preserved.items():
+        formatted = formatted.replace(key, value)
+    return formatted
+
+
+def format_reply(text: str, limit: int) -> str:
+    """Format and trim a reply at a sentence or word boundary."""
+    formatted = lowercase_prose(text)
+    if len(formatted) <= limit:
+        return formatted
+
+    shortened = formatted[:limit].rstrip()
+    sentence_end = max(
+        shortened.rfind("."),
+        shortened.rfind("!"),
+        shortened.rfind("?"),
+        shortened.rfind("…"),
+    )
+    if sentence_end >= int(limit * 0.55):
+        return shortened[: sentence_end + 1].rstrip()
+
+    word_end = shortened.rfind(" ")
+    if word_end > 0:
+        shortened = shortened[:word_end].rstrip()
+    return f"{shortened}…"
+
+
+def is_ai_related(text: str) -> bool:
+    """Detect clear AI topics locally without using a model call."""
+    return bool(
+        _AI_TERMS.search(text)
+        or _AI_ABBREVIATION.search(text)
+        or _AI_ABBREVIATION_CONTEXT.search(text)
+    )

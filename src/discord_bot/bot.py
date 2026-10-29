@@ -13,15 +13,22 @@ import discord
 from discord import app_commands
 
 from .behavior import (
+    format_reply,
+    is_ai_related,
     is_conversation_followup,
     is_explicitly_addressed,
     is_relevant_spontaneous_candidate,
-    lowercase_prose,
     normalize_text,
     remove_bot_mention,
 )
 from .gemini_service import ChatTurn, GeminiResponder
+from .interests import (
+    alias_context_for,
+    interest_context_for,
+    resolve_alias,
+)
 from .mood import (
+    MoodSnapshot,
     classify_mood_signal,
     format_huh_report,
     mood_prompt_context,
@@ -31,6 +38,8 @@ from .settings import (
     CONTEXT_MESSAGE_COUNT,
     CONVERSATION_CONTINUATION_SECONDS,
     CREATOR_USER_IDS,
+    AI_REACTION_COOLDOWN_SECONDS,
+    MAX_CONTEXT_CHARACTERS,
     MAX_CHANNEL_HISTORIES,
     MAX_CONCURRENT_GEMINI_REQUESTS,
     MAX_CONVERSATION_FOLLOWUPS,
@@ -71,6 +80,9 @@ class KikiBot(discord.Client):
         self.gemini = GeminiResponder(api_key) if api_key else None
         self.mood_store = MoodStore(STATE_DB_PATH)
         self._mood_store_ready = False
+        self._mood_snapshots: OrderedDict[
+            int, tuple[float, MoodSnapshot]
+        ] = OrderedDict()
         self._histories: OrderedDict[int, deque[ChatTurn]] = OrderedDict()
         self._last_reply_at: dict[int, float] = {}
         self._last_user_reply_at: OrderedDict[tuple[int, int], float] = OrderedDict()
@@ -79,6 +91,9 @@ class KikiBot(discord.Client):
         ] = OrderedDict()
         self._seen_message_ids: OrderedDict[int, None] = OrderedDict()
         self._bot_reply_ids: OrderedDict[int, None] = OrderedDict()
+        self._reacted_message_ids: OrderedDict[int, None] = OrderedDict()
+        self._last_ai_reaction_at: dict[int, float] = {}
+        self._reaction_tasks: set[asyncio.Task[None]] = set()
         self._pending_channels: set[int] = set()
         self._gemini_slots = asyncio.Semaphore(MAX_CONCURRENT_GEMINI_REQUESTS)
 
@@ -127,6 +142,7 @@ class KikiBot(discord.Client):
         while len(self._histories) > MAX_CHANNEL_HISTORIES:
             oldest_channel_id, _ = self._histories.popitem(last=False)
             self._last_reply_at.pop(oldest_channel_id, None)
+            self._last_ai_reaction_at.pop(oldest_channel_id, None)
             for key in tuple(self._active_conversations):
                 if key[0] == oldest_channel_id:
                     self._active_conversations.pop(key, None)
@@ -180,13 +196,57 @@ class KikiBot(discord.Client):
             normalize_text(getattr(author, "display_name", "")),
             normalize_text(getattr(author, "name", "")),
         }
-        return bool(names & {"helv", "mari"})
+        return any(resolve_alias(name) == "helv/mari" for name in names)
 
     def _author_label(self, author: discord.abc.User) -> str:
         if self._is_creator(author):
             return "helv/mari (a mesma criadora)"
         display_name = getattr(author, "display_name", None) or author.name
+        names = {
+            normalize_text(str(display_name)),
+            normalize_text(getattr(author, "name", "")),
+        }
+        if any(resolve_alias(name) == "monkey games" for name in names):
+            return "Monkey Games (Sakamoto/Scott/Philips/Philipe)"
         return str(display_name)[:80]
+
+    def _select_context(
+        self,
+        history: deque[ChatTurn],
+        current_user_id: int,
+    ) -> list[ChatTurn]:
+        """Keep recent channel context compact and favor the active speaker."""
+        turns = list(history)
+        selected: list[ChatTurn] = []
+        used_characters = 0
+        other_user_turns = 0
+        for index in range(len(turns) - 1, -1, -1):
+            turn = turns[index]
+            current = index == len(turns) - 1
+            belongs_to_current_user = turn.author_id == current_user_id
+            if not current and not belongs_to_current_user:
+                if turn.role == "user":
+                    if other_user_turns >= 2:
+                        continue
+                    other_user_turns += 1
+
+            cost = len(turn.author) + len(turn.text) + 8
+            if selected and used_characters + cost > MAX_CONTEXT_CHARACTERS:
+                continue
+            selected.append(turn)
+            used_characters += cost
+        selected.reverse()
+        return selected
+
+    def _cache_mood_snapshot(
+        self,
+        guild_id: int,
+        snapshot: MoodSnapshot,
+    ) -> None:
+        self._mood_snapshots[guild_id] = (time.monotonic(), snapshot)
+        self._mood_snapshots.move_to_end(guild_id)
+        while len(self._mood_snapshots) > MAX_CHANNEL_HISTORIES:
+            self._mood_snapshots.popitem(last=False)
 
     async def _record_mood_signal(
         self,
@@ -195,28 +255,42 @@ class KikiBot(discord.Client):
         *,
         addressed_to_kiki: bool,
         is_creator: bool,
-    ) -> None:
+    ) -> MoodSnapshot | None:
         if not self._mood_store_ready:
-            return
+            return None
         signal = classify_mood_signal(
             text,
             addressed_to_kiki=addressed_to_kiki,
             is_creator=is_creator,
         )
         if signal is None:
-            return
+            return None
         try:
-            await self.mood_store.record_signal(guild_id, signal)
+            snapshot = await self.mood_store.record_signal(guild_id, signal)
+            self._cache_mood_snapshot(guild_id, snapshot)
+            return snapshot
         except (OSError, sqlite3.Error) as error:
             logger.warning(
                 "Could not update mood state (%s).", type(error).__name__
             )
+            return None
 
-    async def _mood_context(self, guild_id: int) -> str:
+    async def _mood_context(
+        self,
+        guild_id: int,
+        snapshot: MoodSnapshot | None = None,
+    ) -> str:
         if not self._mood_store_ready:
             return ""
         try:
-            snapshot = await self.mood_store.snapshot(guild_id)
+            if snapshot is None:
+                cached = self._mood_snapshots.get(guild_id)
+                if cached is not None and time.monotonic() - cached[0] < 30:
+                    snapshot = cached[1]
+                    self._mood_snapshots.move_to_end(guild_id)
+            if snapshot is None:
+                snapshot = await self.mood_store.snapshot(guild_id)
+                self._cache_mood_snapshot(guild_id, snapshot)
             return mood_prompt_context(snapshot)
         except (OSError, sqlite3.Error) as error:
             logger.warning(
@@ -225,6 +299,7 @@ class KikiBot(discord.Client):
             return ""
 
     async def on_message(self, message: discord.Message) -> None:
+        received_at = time.perf_counter()
         message_id = getattr(message, "id", None)
         if message_id is not None:
             if message_id in self._seen_message_ids:
@@ -244,6 +319,7 @@ class KikiBot(discord.Client):
         original_text = message.content.strip()
         if not original_text:
             return
+        self._schedule_ai_reaction(message, original_text)
 
         user_id = message.author.id
         channel_id = message.channel.id
@@ -277,9 +353,10 @@ class KikiBot(discord.Client):
                 role="user",
                 author=self._author_label(message.author),
                 text=text[:MAX_INPUT_CHARACTERS],
+                author_id=user_id,
             )
         )
-        await self._record_mood_signal(
+        mood_snapshot = await self._record_mood_signal(
             guild_id,
             text,
             addressed_to_kiki=explicitly_addressed or continuation,
@@ -310,23 +387,36 @@ class KikiBot(discord.Client):
             ):
                 return
 
+        selected_at = time.perf_counter()
         self._pending_channels.add(channel_id)
         try:
-            mood_context = await self._mood_context(guild_id)
+            mood_context = await self._mood_context(guild_id, mood_snapshot)
+            selected_context = self._select_context(history, user_id)
+            recent_texts = [turn.text for turn in selected_context[-4:]]
+            interests = interest_context_for(recent_texts)
+            aliases = alias_context_for(recent_texts)
             async with self._gemini_slots:
-                generated_text = await self.gemini.generate_reply(
-                    list(history),
-                    mood_context=mood_context,
-                    allow_silence=not explicitly_addressed and not continuation,
-                )
+                async with message.channel.typing():
+                    request_started = time.perf_counter()
+                    generated_text = await self.gemini.generate_reply(
+                        selected_context,
+                        mood_context=mood_context,
+                        interest_context=interests,
+                        alias_context=aliases,
+                        allow_silence=False,
+                    )
+                    gemini_ms = round(
+                        (time.perf_counter() - request_started) * 1_000
+                    )
 
             if not generated_text:
                 return
 
-            reply = lowercase_prose(generated_text)[:MAX_REPLY_CHARACTERS]
+            reply = format_reply(generated_text, MAX_REPLY_CHARACTERS)
             if not reply:
                 return
 
+            send_started = time.perf_counter()
             try:
                 sent_message = await message.reply(
                     reply,
@@ -339,8 +429,16 @@ class KikiBot(discord.Client):
                     error.status,
                 )
                 return
+            send_ms = round((time.perf_counter() - send_started) * 1_000)
 
-            history.append(ChatTurn(role="model", author="kiki", text=reply))
+            history.append(
+                ChatTurn(
+                    role="model",
+                    author="kiki",
+                    text=reply,
+                    author_id=user_id,
+                )
+            )
             sent_id = getattr(sent_message, "id", None)
             if sent_id is not None:
                 self._remember_id(
@@ -373,12 +471,63 @@ class KikiBot(discord.Client):
                     self._active_conversations.popitem(last=False)
             else:
                 self._active_conversations.pop(conversation_key, None)
+            logger.info(
+                "Reply timing: pre_request_ms=%d gemini_ms=%d discord_send_ms=%d total_ms=%d.",
+                round((request_started - selected_at) * 1_000),
+                gemini_ms,
+                send_ms,
+                round((time.perf_counter() - received_at) * 1_000),
+            )
         except Exception as error:
             logger.warning(
                 "Kiki could not generate a reply (%s).", type(error).__name__
             )
         finally:
             self._pending_channels.discard(channel_id)
+
+    def _schedule_ai_reaction(
+        self,
+        message: discord.Message,
+        text: str,
+    ) -> None:
+        """Schedule a rare native 👀 reaction without blocking message handling."""
+        message_id = getattr(message, "id", None)
+        channel_id = getattr(message.channel, "id", None)
+        if (
+            message_id is None
+            or channel_id is None
+            or message_id in self._reacted_message_ids
+            or not is_ai_related(text)
+        ):
+            return
+
+        now = time.monotonic()
+        last_reaction = self._last_ai_reaction_at.get(channel_id)
+        if (
+            last_reaction is not None
+            and now - last_reaction < AI_REACTION_COOLDOWN_SECONDS
+        ):
+            return
+
+        self._remember_id(
+            self._reacted_message_ids, message_id, MAX_SEEN_MESSAGES
+        )
+        self._last_ai_reaction_at[channel_id] = now
+        task = asyncio.create_task(self._add_ai_reaction(message))
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _add_ai_reaction(self, message: discord.Message) -> None:
+        try:
+            await message.add_reaction("👀")
+        except discord.HTTPException as error:
+            logger.info(
+                "Could not add AI-topic reaction (HTTP %s).", error.status
+            )
+        except Exception as error:
+            logger.info(
+                "Could not add AI-topic reaction (%s).", type(error).__name__
+            )
 
     async def close(self) -> None:
         try:

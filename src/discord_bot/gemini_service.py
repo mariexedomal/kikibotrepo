@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Literal
 
@@ -29,6 +30,7 @@ class ChatTurn:
     role: Literal["user", "model"]
     author: str
     text: str
+    author_id: int | None = None
 
 
 def _is_transient_error(error: Exception) -> bool:
@@ -80,6 +82,8 @@ class GeminiResponder:
         turns: list[ChatTurn],
         *,
         mood_context: str = "",
+        interest_context: str = "",
+        alias_context: str = "",
         allow_silence: bool = False,
     ) -> str | None:
         contents = [
@@ -94,6 +98,10 @@ class GeminiResponder:
             for turn in turns
         ]
         system_instruction = KIKI_PERSONALITY
+        if alias_context:
+            system_instruction += f"\n\nIDENTIDADES MENCIONADAS:\n{alias_context}"
+        if interest_context:
+            system_instruction += f"\n\n{interest_context}"
         if mood_context:
             system_instruction += f"\n\nESTADO ATUAL:\n{mood_context}"
         if allow_silence:
@@ -105,9 +113,13 @@ class GeminiResponder:
             system_instruction=system_instruction,
             temperature=0.9,
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.LOW
+            ),
         )
 
         for attempt in range(GEMINI_MAX_RETRIES + 1):
+            attempt_started = time.perf_counter()
             try:
                 response = await self._client.aio.models.generate_content(
                     model=GEMINI_MODEL,
@@ -115,6 +127,10 @@ class GeminiResponder:
                     config=request_config,
                 )
                 text = response.text
+                logger.info(
+                    "Gemini request attempt completed in %d ms.",
+                    round((time.perf_counter() - attempt_started) * 1_000),
+                )
                 if not text or not text.strip():
                     return None
                 text = text.strip()
@@ -122,10 +138,12 @@ class GeminiResponder:
                     return None
                 return text
             except Exception as error:
+                elapsed_ms = round((time.perf_counter() - attempt_started) * 1_000)
                 if _is_transient_error(error) and attempt < GEMINI_MAX_RETRIES:
                     delay = min(2**attempt, 4)
                     logger.warning(
-                        "Gemini request had a temporary failure; retrying in %s second(s).",
+                        "Gemini request attempt failed in %d ms; retrying in %s second(s).",
+                        elapsed_ms,
                         delay,
                     )
                     await asyncio.sleep(delay)
@@ -134,7 +152,8 @@ class GeminiResponder:
                 # Do not log the exception body: provider errors can contain request details.
                 status = _safe_http_status(error)
                 logger.warning(
-                    "Gemini request failed; skipping this reply (%s%s).",
+                    "Gemini request failed in %d ms; skipping this reply (%s%s).",
+                    elapsed_ms,
                     type(error).__name__,
                     f", HTTP {status}" if status is not None else "",
                 )

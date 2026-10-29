@@ -105,9 +105,21 @@ MAX_INPUT_CHARACTERS = _int_setting(
 )
 MAX_REPLY_CHARACTERS = _int_setting(
     "KIKI_MAX_REPLY_CHARACTERS",
-    700,
+    1_500,
     minimum=100,
     maximum=1_800,
+)
+MAX_CONTEXT_CHARACTERS = _int_setting(
+    "KIKI_MAX_CONTEXT_CHARACTERS",
+    6_000,
+    minimum=1_000,
+    maximum=20_000,
+)
+AI_REACTION_COOLDOWN_SECONDS = _float_setting(
+    "KIKI_AI_REACTION_COOLDOWN_SECONDS",
+    90.0,
+    minimum=0.0,
+    maximum=86_400.0,
 )
 
 MAX_CHANNEL_HISTORIES = 100
