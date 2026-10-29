@@ -1,6 +1,6 @@
 # Python Discord Bot
 
-A Python Discord bot with `/ping` and `/hello` slash commands plus occasional
+A Python Discord bot with `/ping`, `/hello`, and `/huh` slash commands plus
 Brazilian Portuguese conversation powered by Gemini.
 
 ## Run & Operate
@@ -13,7 +13,7 @@ Brazilian Portuguese conversation powered by Gemini.
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required secrets: `DISCORD_BOT_TOKEN`, `GEMINI_API_KEY`
 - Discord Developer Portal: enable Message Content Intent for regular chat replies
-- `README.md` — bot setup, permissions, configuration, cost, and privacy notes
+- `README.md` — bot setup, commands, mood, configuration, cost, and privacy notes
 
 ## Stack
 
@@ -28,10 +28,14 @@ Brazilian Portuguese conversation powered by Gemini.
 ## Where things live
 
 - `src/discord_bot/bot.py` — Discord client, slash commands, and message handling
+- `src/discord_bot/behavior.py` — lightweight address, relevance, and formatting cues
+- `src/discord_bot/mood.py` — bounded mood rules and user-facing summaries
+- `src/discord_bot/state_store.py` — per-server SQLite mood state, without raw messages
 - `src/discord_bot/personality.py` — Kiki's editable persona instructions
 - `src/discord_bot/gemini_service.py` — asynchronous Gemini requests and retries
-- `src/discord_bot/settings.py` — configurable reply and context limits
+- `src/discord_bot/settings.py` — configurable reply, continuity, and context limits
 - `pyproject.toml` / `uv.lock` — Python project metadata and locked dependencies
+- `data/kiki-state.sqlite3` — local mood state; ignored by Git and not durable in published deployments
 - `artifacts/api-server` — shared API service
 - `artifacts/mockup-sandbox` — design canvas preview service
 

@@ -53,6 +53,19 @@ def _is_transient_error(error: Exception) -> bool:
     )
 
 
+def _safe_http_status(error: Exception) -> int | None:
+    """Return only a numeric HTTP status; never expose provider error text."""
+    for attribute in ("status_code", "code"):
+        value = getattr(error, attribute, None)
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 400 <= status <= 599:
+            return status
+    return None
+
+
 class GeminiResponder:
     """Generates Kiki's replies without logging prompts or credentials."""
 
@@ -62,7 +75,13 @@ class GeminiResponder:
     async def close(self) -> None:
         await self._client.aio.aclose()
 
-    async def generate_reply(self, turns: list[ChatTurn]) -> str | None:
+    async def generate_reply(
+        self,
+        turns: list[ChatTurn],
+        *,
+        mood_context: str = "",
+        allow_silence: bool = False,
+    ) -> str | None:
         contents = [
             types.Content(
                 role=turn.role,
@@ -74,8 +93,16 @@ class GeminiResponder:
             )
             for turn in turns
         ]
+        system_instruction = KIKI_PERSONALITY
+        if mood_context:
+            system_instruction += f"\n\nESTADO ATUAL:\n{mood_context}"
+        if allow_silence:
+            system_instruction += (
+                "\n\nESTA É UMA OPORTUNIDADE ESPONTÂNEA. Se não houver uma "
+                "contribuição realmente relevante, responda exatamente [[SILENT]]."
+            )
         request_config = types.GenerateContentConfig(
-            system_instruction=KIKI_PERSONALITY,
+            system_instruction=system_instruction,
             temperature=0.9,
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         )
@@ -88,7 +115,12 @@ class GeminiResponder:
                     config=request_config,
                 )
                 text = response.text
-                return text.strip() if text and text.strip() else None
+                if not text or not text.strip():
+                    return None
+                text = text.strip()
+                if text.casefold() == "[[silent]]":
+                    return None
+                return text
             except Exception as error:
                 if _is_transient_error(error) and attempt < GEMINI_MAX_RETRIES:
                     delay = min(2**attempt, 4)
@@ -100,9 +132,11 @@ class GeminiResponder:
                     continue
 
                 # Do not log the exception body: provider errors can contain request details.
+                status = _safe_http_status(error)
                 logger.warning(
-                    "Gemini request failed; skipping this reply (%s).",
+                    "Gemini request failed; skipping this reply (%s%s).",
                     type(error).__name__,
+                    f", HTTP {status}" if status is not None else "",
                 )
                 return None
 
