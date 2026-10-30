@@ -94,7 +94,7 @@ class KikiBot(discord.Client):
         self._reacted_message_ids: OrderedDict[int, None] = OrderedDict()
         self._last_ai_reaction_at: dict[int, float] = {}
         self._reaction_tasks: set[asyncio.Task[None]] = set()
-        self._pending_channels: set[int] = set()
+        self._pending_conversations: set[tuple[int, int]] = set()
         self._gemini_slots = asyncio.Semaphore(MAX_CONCURRENT_GEMINI_REQUESTS)
 
     async def setup_hook(self) -> None:
@@ -303,6 +303,7 @@ class KikiBot(discord.Client):
         message_id = getattr(message, "id", None)
         if message_id is not None:
             if message_id in self._seen_message_ids:
+                logger.debug("Message skipped: duplicate Discord event.")
                 return
             self._remember_id(
                 self._seen_message_ids, message_id, MAX_SEEN_MESSAGES
@@ -314,17 +315,27 @@ class KikiBot(discord.Client):
             or not isinstance(message.channel, (discord.TextChannel, discord.Thread))
             or message.guild is None
         ):
+            logger.debug("Message skipped: bot, webhook, or unsupported channel.")
             return
 
         original_text = message.content.strip()
         if not original_text:
+            if not getattr(message, "attachments", None):
+                logger.warning(
+                    "Discord delivered an empty message body; verify the "
+                    "Message Content Intent in the Developer Portal."
+                )
             return
         self._schedule_ai_reaction(message, original_text)
 
         user_id = message.author.id
         channel_id = message.channel.id
         guild_id = message.guild.id
-        mentioned_kiki = self.user is not None and self.user in message.mentions
+        bot_user_id = getattr(self.user, "id", None)
+        mentioned_kiki = bot_user_id is not None and any(
+            getattr(mention, "id", None) == bot_user_id
+            for mention in message.mentions
+        )
         replied_to_kiki = self._message_replies_to_kiki(message)
         name_address = is_explicitly_addressed(original_text)
         explicitly_addressed = mentioned_kiki or name_address or replied_to_kiki
@@ -346,6 +357,14 @@ class KikiBot(discord.Client):
             replied_to_kiki,
             now,
         )
+        logger.info(
+            "Message received: direct=%s mention=%s name=%s reply=%s continuation=%s.",
+            explicitly_addressed,
+            mentioned_kiki,
+            name_address,
+            replied_to_kiki,
+            continuation,
+        )
 
         history = self._get_history(channel_id)
         history.append(
@@ -356,6 +375,7 @@ class KikiBot(discord.Client):
                 author_id=user_id,
             )
         )
+        selected_context = self._select_context(history, user_id)
         mood_snapshot = await self._record_mood_signal(
             guild_id,
             text,
@@ -363,13 +383,20 @@ class KikiBot(discord.Client):
             is_creator=self._is_creator(message.author),
         )
 
-        if self.gemini is None or channel_id in self._pending_channels:
+        if self.gemini is None:
+            logger.warning("Reply skipped: Gemini API is not configured.")
+            return
+        conversation_key = (channel_id, user_id)
+        if conversation_key in self._pending_conversations:
+            logger.info("Reply skipped: this user's conversation is already processing.")
             return
 
         if not explicitly_addressed and not continuation:
             if not is_relevant_spontaneous_candidate(text):
+                logger.debug("Reply skipped: message did not pass relevance checks.")
                 return
             if random.random() >= REPLY_PROBABILITY:
+                logger.debug("Reply skipped: spontaneous participation chance.")
                 return
 
         if not continuation:
@@ -378,6 +405,7 @@ class KikiBot(discord.Client):
                 last_channel_reply is not None
                 and now - last_channel_reply < CHANNEL_COOLDOWN_SECONDS
             ):
+                logger.info("Reply skipped: channel cooldown.")
                 return
             user_key = (guild_id, user_id)
             last_user_reply = self._last_user_reply_at.get(user_key)
@@ -385,13 +413,21 @@ class KikiBot(discord.Client):
                 last_user_reply is not None
                 and now - last_user_reply < USER_COOLDOWN_SECONDS
             ):
+                logger.info("Reply skipped: user cooldown.")
                 return
 
         selected_at = time.perf_counter()
-        self._pending_channels.add(channel_id)
+        self._pending_conversations.add(conversation_key)
+        reserved_at = time.monotonic()
+        if not continuation:
+            # Reserve cooldowns before awaiting Gemini so simultaneous messages
+            # cannot start duplicate work in the same channel or for one user.
+            self._last_reply_at[channel_id] = reserved_at
+            self._last_user_reply_at[(
+                guild_id, user_id
+            )] = reserved_at
         try:
             mood_context = await self._mood_context(guild_id, mood_snapshot)
-            selected_context = self._select_context(history, user_id)
             recent_texts = [turn.text for turn in selected_context[-4:]]
             interests = interest_context_for(recent_texts)
             aliases = alias_context_for(recent_texts)
@@ -410,6 +446,7 @@ class KikiBot(discord.Client):
                     )
 
             if not generated_text:
+                logger.info("Reply skipped: Gemini returned no usable text.")
                 return
 
             reply = format_reply(generated_text, MAX_REPLY_CHARACTERS)
@@ -453,7 +490,6 @@ class KikiBot(discord.Client):
             while len(self._last_user_reply_at) > MAX_SEEN_MESSAGES:
                 self._last_user_reply_at.popitem(last=False)
 
-            conversation_key = (channel_id, user_id)
             if continuation:
                 prior = self._active_conversations.get(conversation_key)
                 followups_left = (
@@ -483,7 +519,7 @@ class KikiBot(discord.Client):
                 "Kiki could not generate a reply (%s).", type(error).__name__
             )
         finally:
-            self._pending_channels.discard(channel_id)
+            self._pending_conversations.discard(conversation_key)
 
     def _schedule_ai_reaction(
         self,
@@ -519,7 +555,8 @@ class KikiBot(discord.Client):
 
     async def _add_ai_reaction(self, message: discord.Message) -> None:
         try:
-            await message.add_reaction("👀")
+            async with asyncio.timeout(10):
+                await message.add_reaction("👀")
         except discord.HTTPException as error:
             logger.info(
                 "Could not add AI-topic reaction (HTTP %s).", error.status

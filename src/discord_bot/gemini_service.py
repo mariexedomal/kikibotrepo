@@ -10,7 +10,13 @@ from google import genai
 from google.genai import types
 
 from .personality import KIKI_PERSONALITY
-from .settings import GEMINI_MAX_OUTPUT_TOKENS, GEMINI_MAX_RETRIES, GEMINI_MODEL
+from .settings import (
+    GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_MAX_RETRIES,
+    GEMINI_MODEL,
+    GEMINI_REQUEST_TIMEOUT_SECONDS,
+    GEMINI_TOTAL_TIMEOUT_SECONDS,
+)
 
 logger = logging.getLogger("discord_bot.gemini")
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -72,7 +78,13 @@ class GeminiResponder:
     """Generates Kiki's replies without logging prompts or credentials."""
 
     def __init__(self, api_key: str) -> None:
-        self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS * 1_000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
 
     async def close(self) -> None:
         await self._client.aio.aclose()
@@ -118,45 +130,70 @@ class GeminiResponder:
             ),
         )
 
-        for attempt in range(GEMINI_MAX_RETRIES + 1):
-            attempt_started = time.perf_counter()
-            try:
-                response = await self._client.aio.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=request_config,
-                )
-                text = response.text
-                logger.info(
-                    "Gemini request attempt completed in %d ms.",
-                    round((time.perf_counter() - attempt_started) * 1_000),
-                )
-                if not text or not text.strip():
-                    return None
-                text = text.strip()
-                if text.casefold() == "[[silent]]":
-                    return None
-                return text
-            except Exception as error:
-                elapsed_ms = round((time.perf_counter() - attempt_started) * 1_000)
-                if _is_transient_error(error) and attempt < GEMINI_MAX_RETRIES:
-                    delay = min(2**attempt, 4)
-                    logger.warning(
-                        "Gemini request attempt failed in %d ms; retrying in %s second(s).",
-                        elapsed_ms,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
+        total_started = time.perf_counter()
+        try:
+            async with asyncio.timeout(GEMINI_TOTAL_TIMEOUT_SECONDS):
+                for attempt in range(GEMINI_MAX_RETRIES + 1):
+                    attempt_started = time.perf_counter()
+                    try:
+                        async with asyncio.timeout(GEMINI_REQUEST_TIMEOUT_SECONDS):
+                            response = await self._client.aio.models.generate_content(
+                                model=GEMINI_MODEL,
+                                contents=contents,
+                                config=request_config,
+                            )
+                        text = response.text
+                        logger.info(
+                            "Gemini request attempt completed in %d ms.",
+                            round((time.perf_counter() - attempt_started) * 1_000),
+                        )
+                        if not text or not text.strip():
+                            logger.info("Gemini returned an empty response.")
+                            return None
+                        text = text.strip()
+                        if text.casefold() == "[[silent]]":
+                            logger.info("Gemini selected silence.")
+                            return None
+                        return text
+                    except Exception as error:
+                        elapsed_ms = round(
+                            (time.perf_counter() - attempt_started) * 1_000
+                        )
+                        if (
+                            _is_transient_error(error)
+                            and attempt < GEMINI_MAX_RETRIES
+                        ):
+                            delay = 0.5
+                            logger.warning(
+                                "Gemini attempt failed in %d ms (%s%s); "
+                                "one retry in %.1f second(s).",
+                                elapsed_ms,
+                                type(error).__name__,
+                                (
+                                    f", HTTP {_safe_http_status(error)}"
+                                    if _safe_http_status(error) is not None
+                                    else ""
+                                ),
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
 
-                # Do not log the exception body: provider errors can contain request details.
-                status = _safe_http_status(error)
-                logger.warning(
-                    "Gemini request failed in %d ms; skipping this reply (%s%s).",
-                    elapsed_ms,
-                    type(error).__name__,
-                    f", HTTP {status}" if status is not None else "",
-                )
-                return None
+                        # Provider error bodies may contain request details.
+                        status = _safe_http_status(error)
+                        logger.warning(
+                            "Gemini request failed in %d ms; skipping this reply (%s%s).",
+                            elapsed_ms,
+                            type(error).__name__,
+                            f", HTTP {status}" if status is not None else "",
+                        )
+                        return None
+        except TimeoutError:
+            logger.warning(
+                "Gemini request exceeded the %d-second total timeout after %d ms.",
+                GEMINI_TOTAL_TIMEOUT_SECONDS,
+                round((time.perf_counter() - total_started) * 1_000),
+            )
+            return None
 
         return None
